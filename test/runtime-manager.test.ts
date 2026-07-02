@@ -3,7 +3,8 @@ import type { StoredChatBinding } from "../src/server/bindings/binding-store.js"
 import type {
   PiRpcDelivery,
   PiRpcShutdownResult,
-  PiRpcState
+  PiRpcState,
+  PiRpcControlCommand
 } from "../src/server/pi/pi-rpc-client.js";
 import {
   RuntimeManager,
@@ -13,6 +14,7 @@ import {
 class FakeManagedPiClient implements ManagedPiClient {
   readonly pid = 1234;
   readonly deliveredMessages: string[] = [];
+  readonly controlCommands: PiRpcControlCommand[] = [];
   readonly shutdownGracePeriods: number[] = [];
   private readonly exitListeners = new Set<() => void>();
   killed = false;
@@ -58,6 +60,22 @@ class FakeManagedPiClient implements ManagedPiClient {
     return `reply:${message}`;
   }
 
+  async sendControlCommand(command: PiRpcControlCommand): Promise<unknown> {
+    this.controlCommands.push(command);
+    if (command.type === "get_available_models") {
+      return {
+        models: [
+          {
+            provider: "deepseek",
+            id: "deepseek-v4-flash"
+          }
+        ]
+      };
+    }
+
+    return undefined;
+  }
+
   async shutdown(gracePeriodMs?: number): Promise<PiRpcShutdownResult> {
     this.shutdownGracePeriods.push(gracePeriodMs ?? 0);
     this.killed = true;
@@ -95,7 +113,8 @@ function createBinding(id: string): StoredChatBinding {
     workspacePath: `C:\\data\\${id}`,
     sessionId: `s-${id}`,
     sessionDir: `C:\\data\\${id}\\.pi-sessions`,
-    inboxDir: `C:\\data\\${id}\\inbox`
+    inboxDir: `C:\\data\\${id}\\inbox`,
+    protectedRuntime: false
   };
 }
 
@@ -267,6 +286,59 @@ describe("RuntimeManager", () => {
     expect(client.killed).toBe(true);
   });
 
+  it("does not reap idle clients when idle reaping is disabled", async () => {
+    let now = 0;
+    let idleReapingEnabled = false;
+    const first = new FakeManagedPiClient();
+    const manager = new RuntimeManager({
+      maxProcesses: 1,
+      idleTimeoutMs: 1_000,
+      now: () => now,
+      idleReapingEnabled: () => idleReapingEnabled,
+      clientFactory: async () => first
+    });
+
+    await manager.deliver(createBinding("user-a"), "first");
+    now = 2_000;
+
+    await expect(manager.reapIdle()).resolves.toBe(0);
+    expect(first.killed).toBe(false);
+    await expect(manager.deliver(createBinding("user-b"), "second")).rejects.toThrow("Pi process limit reached");
+
+    idleReapingEnabled = true;
+    await expect(manager.reapIdle()).resolves.toBe(1);
+    expect(first.killed).toBe(true);
+  });
+
+  it("skips protected clients while reaping idle runtimes", async () => {
+    let now = 0;
+    const protectedClient = new FakeManagedPiClient();
+    const unprotectedClient = new FakeManagedPiClient();
+    const clients = [protectedClient, unprotectedClient];
+    const manager = new RuntimeManager({
+      maxProcesses: 50,
+      idleTimeoutMs: 1_000,
+      now: () => now,
+      isProtected: (binding) => binding.externalChatId === "protected-user",
+      clientFactory: async () => {
+        const client = clients.shift();
+        if (client === undefined) {
+          throw new Error("missing fake client");
+        }
+        return client;
+      }
+    });
+
+    await manager.deliver(createBinding("protected-user"), "protected");
+    await manager.deliver(createBinding("normal-user"), "normal");
+    now = 2_000;
+
+    await expect(manager.reapIdle()).resolves.toBe(1);
+    expect(protectedClient.killed).toBe(false);
+    expect(unprotectedClient.killed).toBe(true);
+    expect(manager.activeCount).toBe(1);
+  });
+
   it("does not kill a client when get_state fails", async () => {
     let now = 0;
     const first = new FakeManagedPiClient();
@@ -365,5 +437,91 @@ describe("RuntimeManager", () => {
     client.emitExit();
 
     expect(manager.activeCount).toBe(0);
+  });
+
+  it("lists live runtime entries with binding metadata and state", async () => {
+    const client = new FakeManagedPiClient();
+    const manager = new RuntimeManager({
+      maxProcesses: 50,
+      idleTimeoutMs: 30 * 60 * 1000,
+      clientFactory: async () => client
+    });
+    const binding = createBinding("user-a");
+
+    await manager.runMessage(binding, "hello");
+
+    await expect(manager.listEntries()).resolves.toEqual([
+      expect.objectContaining({
+        binding,
+        pid: 1234,
+        activeOperations: 0,
+        state: expect.objectContaining({
+          sessionId: "s-test",
+          isStreaming: false
+        })
+      })
+    ]);
+  });
+
+  it("sends a control command to an existing runtime without creating a new process", async () => {
+    const client = new FakeManagedPiClient();
+    let created = 0;
+    const manager = new RuntimeManager({
+      maxProcesses: 50,
+      idleTimeoutMs: 30 * 60 * 1000,
+      clientFactory: async () => {
+        created += 1;
+        return client;
+      }
+    });
+    const binding = createBinding("user-a");
+
+    await manager.runMessage(binding, "hello");
+    await expect(
+      manager.sendControlCommand(binding, {
+        type: "set_auto_compaction",
+        enabled: false
+      })
+    ).resolves.toBeUndefined();
+
+    expect(created).toBe(1);
+    expect(client.controlCommands).toEqual([
+      {
+        type: "set_auto_compaction",
+        enabled: false
+      }
+    ]);
+  });
+
+  it("shuts down a single runtime and leaves other sessions alive", async () => {
+    const first = new FakeManagedPiClient();
+    const second = new FakeManagedPiClient();
+    const clients = [first, second];
+    const manager = new RuntimeManager({
+      maxProcesses: 50,
+      idleTimeoutMs: 30 * 60 * 1000,
+      clientFactory: async () => {
+        const client = clients.shift();
+        if (client === undefined) {
+          throw new Error("missing fake client");
+        }
+        return client;
+      }
+    });
+    const firstBinding = createBinding("user-a");
+    const secondBinding = createBinding("user-b");
+
+    await manager.runMessage(firstBinding, "first");
+    await manager.runMessage(secondBinding, "second");
+
+    await expect(manager.shutdownBinding(firstBinding, "admin_reset")).resolves.toEqual({
+      stopped: true,
+      result: "exited"
+    });
+
+    expect(first.killed).toBe(true);
+    expect(second.killed).toBe(false);
+    expect(manager.activeCount).toBe(1);
+    await expect(manager.sendControlCommand(secondBinding, { type: "set_auto_retry", enabled: false })).resolves.toBeUndefined();
   });
 });

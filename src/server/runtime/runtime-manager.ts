@@ -1,6 +1,7 @@
 import type { StoredChatBinding } from "../bindings/binding-store.js";
 import {
   DEFAULT_PI_RPC_SHUTDOWN_GRACE_MS,
+  type PiRpcControlCommand,
   type PiRpcDelivery,
   type PiRpcShutdownResult,
   type PiRpcState
@@ -10,6 +11,7 @@ import { logError, logInfo, logWarn, type LogDetails } from "../logging.js";
 export interface ManagedPiClient {
   readonly pid?: number | undefined;
   getState(): Promise<PiRpcState>;
+  sendControlCommand(command: PiRpcControlCommand): Promise<unknown>;
   deliverUserMessage(message: string): Promise<PiRpcDelivery>;
   runUserMessage(message: string): Promise<string>;
   shutdown(gracePeriodMs?: number): Promise<PiRpcShutdownResult>;
@@ -22,6 +24,8 @@ export interface RuntimeManagerOptions {
   readonly idleTimeoutMs: number;
   readonly clientFactory: (binding: StoredChatBinding) => Promise<ManagedPiClient>;
   readonly now?: () => number;
+  readonly idleReapingEnabled?: (() => boolean) | undefined;
+  readonly isProtected?: ((binding: StoredChatBinding) => boolean) | undefined;
 }
 
 interface RuntimeEntry {
@@ -31,19 +35,44 @@ interface RuntimeEntry {
   lastUsedAt: number;
 }
 
+export interface RuntimeEntryView {
+  readonly binding: StoredChatBinding;
+  readonly pid?: number | undefined;
+  readonly activeOperations: number;
+  readonly lastUsedAt: number;
+  readonly state?: PiRpcState | undefined;
+  readonly stateError?: string | undefined;
+}
+
+export interface RuntimeControlResult {
+  readonly result?: unknown;
+  readonly startedRuntime: boolean;
+  readonly stoppedRuntime: boolean;
+  readonly shutdownResult?: PiRpcShutdownResult | undefined;
+}
+
 interface KillInspection {
   readonly state: PiRpcState | undefined;
   readonly canKill: boolean;
   readonly reason: "idle" | "busy" | "state_unavailable";
 }
 
-type ShutdownReason = "idle" | "service_shutdown" | "delivery_error";
+type ShutdownReason =
+  | "idle"
+  | "service_shutdown"
+  | "delivery_error"
+  | "admin_stop"
+  | "admin_reset"
+  | "admin_control"
+  | "scheduled_task";
 
 export class RuntimeManager {
   private readonly maxProcesses: number;
   private readonly idleTimeoutMs: number;
   private readonly clientFactory: (binding: StoredChatBinding) => Promise<ManagedPiClient>;
   private readonly now: () => number;
+  private readonly idleReapingEnabled: () => boolean;
+  private readonly isProtected: (binding: StoredChatBinding) => boolean;
   private readonly entries = new Map<string, RuntimeEntry>();
 
   constructor(options: RuntimeManagerOptions) {
@@ -58,10 +87,40 @@ export class RuntimeManager {
     this.idleTimeoutMs = options.idleTimeoutMs;
     this.clientFactory = options.clientFactory;
     this.now = options.now ?? Date.now;
+    this.idleReapingEnabled = options.idleReapingEnabled ?? (() => true);
+    this.isProtected = options.isProtected ?? (() => false);
   }
 
   get activeCount(): number {
     return this.entries.size;
+  }
+
+  hasLiveRuntime(binding: StoredChatBinding): boolean {
+    return this.entries.has(getBindingKey(binding));
+  }
+
+  async listEntries(): Promise<RuntimeEntryView[]> {
+    return Promise.all(
+      Array.from(this.entries.values()).map(async (entry) => {
+        try {
+          return {
+            binding: entry.binding,
+            pid: entry.client.pid,
+            activeOperations: entry.activeOperations,
+            lastUsedAt: entry.lastUsedAt,
+            state: await entry.client.getState()
+          };
+        } catch (error: unknown) {
+          return {
+            binding: entry.binding,
+            pid: entry.client.pid,
+            activeOperations: entry.activeOperations,
+            lastUsedAt: entry.lastUsedAt,
+            stateError: error instanceof Error ? error.message : String(error)
+          };
+        }
+      })
+    );
   }
 
   async deliver(binding: StoredChatBinding, message: string): Promise<PiRpcDelivery> {
@@ -94,6 +153,78 @@ export class RuntimeManager {
     }
   }
 
+  async sendControlCommand(binding: StoredChatBinding, command: PiRpcControlCommand): Promise<unknown> {
+    const control = await this.runControlCommand(binding, command, {
+      startIfMissing: false,
+      stopIfStarted: false
+    });
+    return control.result;
+  }
+
+  async ensureBinding(binding: StoredChatBinding): Promise<{ readonly startedRuntime: boolean; readonly pid?: number | undefined }> {
+    const key = getBindingKey(binding);
+    const existing = this.entries.get(key);
+    const entry = existing ?? (await this.getOrCreateEntry(binding));
+    return {
+      startedRuntime: existing === undefined,
+      pid: entry.client.pid
+    };
+  }
+
+  async runControlCommand(
+    binding: StoredChatBinding,
+    command: PiRpcControlCommand,
+    options: { readonly startIfMissing: boolean; readonly stopIfStarted: boolean }
+  ): Promise<RuntimeControlResult> {
+    const entry = this.entries.get(getBindingKey(binding));
+    if (entry === undefined && !options.startIfMissing) {
+      throw new Error(`No live Pi process for session: ${binding.sessionId}`);
+    }
+
+    const controlEntry = entry ?? (await this.getOrCreateEntry(binding));
+    const startedRuntime = entry === undefined;
+    let stoppedRuntime = false;
+    let shutdownResult: PiRpcShutdownResult | undefined;
+    let result: unknown;
+    controlEntry.activeOperations += 1;
+    try {
+      result = await controlEntry.client.sendControlCommand(command);
+      controlEntry.lastUsedAt = this.now();
+    } finally {
+      controlEntry.activeOperations -= 1;
+      if (startedRuntime && options.stopIfStarted) {
+        this.entries.delete(getBindingKey(binding));
+        shutdownResult = await this.shutdownEntry(controlEntry, "admin_control");
+        stoppedRuntime = true;
+      }
+    }
+
+    return {
+      result,
+      startedRuntime,
+      stoppedRuntime,
+      shutdownResult
+    };
+  }
+
+  async shutdownBinding(
+    binding: StoredChatBinding,
+    reason: Extract<ShutdownReason, "admin_stop" | "admin_reset" | "scheduled_task"> = "admin_stop"
+  ): Promise<{ readonly stopped: boolean; readonly result?: PiRpcShutdownResult | undefined }> {
+    const key = getBindingKey(binding);
+    const entry = this.entries.get(key);
+    if (entry === undefined) {
+      return { stopped: false };
+    }
+
+    this.entries.delete(key);
+    const result = await this.shutdownEntry(entry, reason);
+    return {
+      stopped: true,
+      result
+    };
+  }
+
   private async getOrCreateEntry(binding: StoredChatBinding): Promise<RuntimeEntry> {
     const key = getBindingKey(binding);
     let entry = this.entries.get(key);
@@ -124,12 +255,26 @@ export class RuntimeManager {
   }
 
   async reapIdle(): Promise<number> {
+    if (!this.idleReapingEnabled()) {
+      return 0;
+    }
+
     let killed = 0;
     const now = this.now();
 
     for (const [key, entry] of this.entries) {
       const idleForMs = now - entry.lastUsedAt;
       if (idleForMs < this.idleTimeoutMs) {
+        continue;
+      }
+
+      if (this.isProtected(entry.binding)) {
+        logInfo("pi.idle_reap_skipped", {
+          sessionId: entry.binding.sessionId,
+          pid: entry.client.pid,
+          reason: "protected_runtime",
+          idleForMs
+        });
         continue;
       }
 

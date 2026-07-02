@@ -49,6 +49,26 @@ describe("outbound file protocol", () => {
     });
   });
 
+  it("extracts a file directive even when it is not the last line", () => {
+    const reply = [
+      "文件已发送，请查收。",
+      "```json",
+      '{"wecom_files":[{"path":"outbox/report.xlsx","type":"file"}]}',
+      "```",
+      "后续补充说明。"
+    ].join("\n");
+
+    expect(extractWeComFileDirectives(reply)).toEqual({
+      text: "文件已发送，请查收。\n\n后续补充说明。",
+      files: [
+        {
+          path: "outbox/report.xlsx",
+          type: "file"
+        }
+      ]
+    });
+  });
+
   it("leaves ordinary JSON in the reply text", () => {
     const reply = '结果是 {"ok":true}';
 

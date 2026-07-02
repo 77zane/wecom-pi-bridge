@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type {
   FileMessage,
@@ -8,42 +7,23 @@ import type {
   SendMsgBody,
   TextMessage,
   VideoMessage,
-  VoiceMessage,
-  WeComMediaType
+  VoiceMessage
 } from "@wecom/aibot-node-sdk";
 import { saveAttachment } from "../attachments/attachment-store.js";
 import type { BindingStore, StoredChatBinding } from "../bindings/binding-store.js";
-import { logInfo, logWarn } from "../logging.js";
+import { logInfo } from "../logging.js";
 import type { ChatMessageQueue } from "../runtime/chat-message-queue.js";
-import {
-  addWeComFileProtocolInstruction,
-  extractWeComFileDirectives,
-  resolveOutboundFilePath,
-  WECOM_FILE_PROTOCOL_VERSION,
-  type WeComFileDirective
-} from "./outbound-file-protocol.js";
+import { ConversationDispatcher, type PiRuntimeRunner, type WeComSender } from "./conversation-dispatcher.js";
 import {
   buildAttachmentNotification,
-  buildMarkdownReplyChunks,
   resolveChatAddress,
   type WeComChatAddress
 } from "./wecom-message.js";
 
-export interface WeComSender {
-  sendMessage(chatId: string, body: SendMsgBody): Promise<void>;
-  uploadMedia(
-    buffer: Buffer,
-    options: { readonly type: WeComMediaType; readonly filename: string }
-  ): Promise<{ readonly mediaId: string }>;
-  sendMediaMessage(chatId: string, type: WeComMediaType, mediaId: string): Promise<void>;
-}
+export type { PiRuntimeRunner, WeComSender } from "./conversation-dispatcher.js";
 
 export interface WeComDownloader {
   downloadFile(url: string, aesKey?: string): Promise<{ buffer: Buffer; filename?: string }>;
-}
-
-export interface PiRuntimeRunner {
-  runMessage(binding: StoredChatBinding, message: string): Promise<string>;
 }
 
 export interface WeComBridgeOptions {
@@ -51,6 +31,7 @@ export interface WeComBridgeOptions {
   readonly queue: ChatMessageQueue;
   readonly runtime: PiRuntimeRunner;
   readonly sender: WeComSender;
+  readonly dispatcher?: ConversationDispatcher | undefined;
   readonly downloader?: WeComDownloader;
   readonly createAttachmentSuffix?: () => string;
 }
@@ -62,6 +43,7 @@ export class WeComBridge {
   private readonly sender: WeComSender;
   private readonly downloader: WeComDownloader | undefined;
   private readonly createAttachmentSuffix: () => string;
+  private readonly dispatcher: ConversationDispatcher;
 
   constructor(options: WeComBridgeOptions) {
     this.bindingStore = options.bindingStore;
@@ -70,6 +52,7 @@ export class WeComBridge {
     this.sender = options.sender;
     this.downloader = options.downloader;
     this.createAttachmentSuffix = options.createAttachmentSuffix ?? (() => randomUUID().slice(0, 8));
+    this.dispatcher = options.dispatcher ?? new ConversationDispatcher(this.bindingStore, this.queue, this.runtime, this.sender);
   }
 
   async handleTextMessage(message: TextMessage): Promise<void> {
@@ -170,76 +153,7 @@ export class WeComBridge {
   }
 
   private async runAndReply(address: WeComChatAddress, binding: StoredChatBinding, prompt: string): Promise<void> {
-    logInfo("message.received", {
-      chatKind: address.kind,
-      sessionId: binding.sessionId
-    });
-
-    const replyText = await this.queue.run(binding, async () => {
-      const shouldInjectProtocol = !this.bindingStore.hasWeComFileProtocol(binding, WECOM_FILE_PROTOCOL_VERSION);
-      const runtimePrompt = shouldInjectProtocol ? addWeComFileProtocolInstruction(prompt) : prompt;
-      const reply = await this.runtime.runMessage(binding, runtimePrompt);
-
-      if (shouldInjectProtocol) {
-        this.bindingStore.markWeComFileProtocol(binding, WECOM_FILE_PROTOCOL_VERSION);
-      }
-
-      return reply;
-    });
-    const extractedReply = extractWeComFileDirectives(replyText);
-
-    logInfo("pi.reply", {
-      chatKind: address.kind,
-      sessionId: binding.sessionId,
-      outboundFileCount: extractedReply.files.length
-    });
-
-    if (extractedReply.text.length > 0) {
-      await this.sendMarkdownReply(address, extractedReply.text);
-    }
-
-    for (const file of extractedReply.files) {
-      await this.sendOutboundFile(address.replyChatId, binding, file);
-    }
-  }
-
-  private async sendMarkdownReply(address: WeComChatAddress, text: string): Promise<void> {
-    const chunks = buildMarkdownReplyChunks({
-      chatKind: address.kind,
-      mentionUserId: address.senderUserId,
-      text
-    });
-
-    for (const chunk of chunks) {
-      await this.sender.sendMessage(address.replyChatId, {
-        msgtype: "markdown",
-        markdown: {
-          content: chunk
-        }
-      });
-    }
-  }
-
-  private async sendOutboundFile(chatId: string, binding: StoredChatBinding, file: WeComFileDirective): Promise<void> {
-    const filePath = resolveOutboundFilePath(binding.workspacePath, file.path);
-    if (filePath === undefined) {
-      logWarn("outbound_file.ignored", {
-        sessionId: binding.sessionId,
-        reason: "outside_outbox"
-      });
-      return;
-    }
-
-    const buffer = await readFile(filePath);
-    const uploaded = await this.sender.uploadMedia(buffer, {
-      type: file.type,
-      filename: path.basename(filePath)
-    });
-    await this.sender.sendMediaMessage(chatId, file.type, uploaded.mediaId);
-    logInfo("outbound_file.sent", {
-      sessionId: binding.sessionId,
-      type: file.type
-    });
+    await this.dispatcher.runPromptAndReply(address, binding, prompt);
   }
 
   private async createAttachmentNotification(options: {

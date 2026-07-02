@@ -7,6 +7,41 @@ import { z } from "zod";
 
 export type PiRpcDelivery = "prompt" | "follow_up";
 export type PiRpcShutdownResult = "already-exited" | "exited" | "killed" | "force-killed" | "kill-timeout";
+export type PiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type PiQueueMode = "all" | "one-at-a-time";
+
+export interface PiModel {
+  readonly id?: string | undefined;
+  readonly provider?: string | undefined;
+  readonly api?: string | undefined;
+  readonly [key: string]: unknown;
+}
+
+export type PiRpcControlCommand =
+  | { readonly id?: string; readonly type: "get_state" }
+  | { readonly id?: string; readonly type: "get_messages" }
+  | { readonly id?: string; readonly type: "get_available_models" }
+  | { readonly id?: string; readonly type: "set_model"; readonly provider: string; readonly modelId: string }
+  | { readonly id?: string; readonly type: "cycle_model" }
+  | { readonly id?: string; readonly type: "set_thinking_level"; readonly level: PiThinkingLevel }
+  | { readonly id?: string; readonly type: "cycle_thinking_level" }
+  | { readonly id?: string; readonly type: "set_steering_mode"; readonly mode: PiQueueMode }
+  | { readonly id?: string; readonly type: "set_follow_up_mode"; readonly mode: PiQueueMode }
+  | { readonly id?: string; readonly type: "compact"; readonly customInstructions?: string | undefined }
+  | { readonly id?: string; readonly type: "set_auto_compaction"; readonly enabled: boolean }
+  | { readonly id?: string; readonly type: "set_auto_retry"; readonly enabled: boolean }
+  | { readonly id?: string; readonly type: "abort_retry" }
+  | { readonly id?: string; readonly type: "abort" }
+  | { readonly id?: string; readonly type: "new_session"; readonly parentSession?: string | undefined }
+  | { readonly id?: string; readonly type: "get_session_stats" }
+  | { readonly id?: string; readonly type: "bash"; readonly command: string }
+  | { readonly id?: string; readonly type: "abort_bash" }
+  | { readonly id?: string; readonly type: "export_html"; readonly outputPath?: string | undefined }
+  | { readonly id?: string; readonly type: "switch_session"; readonly sessionPath: string }
+  | { readonly id?: string; readonly type: "fork"; readonly entryId: string }
+  | { readonly id?: string; readonly type: "clone" }
+  | { readonly id?: string; readonly type: "get_commands" }
+  | { readonly id?: string; readonly type: "set_session_name"; readonly name: string };
 
 export interface PiRpcProcess extends EventEmitter {
   readonly stdin: Writable;
@@ -33,6 +68,7 @@ export interface PiRpcRequestOptions {
 }
 
 export interface PiRpcState {
+  readonly model?: PiModel | null | undefined;
   readonly thinkingLevel: string;
   readonly isStreaming: boolean;
   readonly isCompacting: boolean;
@@ -47,10 +83,7 @@ export interface PiRpcState {
 }
 
 type PiRpcCommand =
-  | {
-      readonly id?: string;
-      readonly type: "get_state";
-    }
+  | PiRpcControlCommand
   | {
       readonly id?: string;
       readonly type: "prompt";
@@ -110,6 +143,7 @@ const rpcResponseSchema = z.discriminatedUnion("success", [
 ]);
 
 const rpcStateSchema = z.object({
+  model: z.record(z.string(), z.unknown()).nullable().optional(),
   thinkingLevel: z.string(),
   isStreaming: z.boolean(),
   isCompacting: z.boolean(),
@@ -124,7 +158,13 @@ const rpcStateSchema = z.object({
 });
 
 const lastAssistantTextSchema = z.object({
-  text: z.string().nullable()
+  text: z.string().nullable().optional()
+});
+
+const modelSchema = z.record(z.string(), z.unknown());
+
+const availableModelsSchema = z.object({
+  models: z.array(modelSchema)
 });
 
 interface AgentEndWaiter {
@@ -187,6 +227,25 @@ export class PiRpcClient extends EventEmitter {
     return rpcStateSchema.parse(response.data);
   }
 
+  async sendControlCommand(command: PiRpcControlCommand): Promise<unknown> {
+    const response = await this.request(command);
+    return response.data === null ? undefined : response.data;
+  }
+
+  async getAvailableModels(): Promise<PiModel[]> {
+    const response = await this.request({ type: "get_available_models" });
+    return availableModelsSchema.parse(response.data).models as PiModel[];
+  }
+
+  async setModel(provider: string, modelId: string): Promise<PiModel> {
+    const response = await this.request({ type: "set_model", provider, modelId });
+    return modelSchema.parse(response.data) as PiModel;
+  }
+
+  async setThinkingLevel(level: PiThinkingLevel): Promise<void> {
+    await this.request({ type: "set_thinking_level", level });
+  }
+
   async prompt(message: string): Promise<void> {
     await this.request({ type: "prompt", message });
   }
@@ -197,7 +256,7 @@ export class PiRpcClient extends EventEmitter {
 
   async getLastAssistantText(): Promise<string | null> {
     const response = await this.request({ type: "get_last_assistant_text" });
-    return lastAssistantTextSchema.parse(response.data).text;
+    return lastAssistantTextSchema.parse(response.data).text ?? null;
   }
 
   async deliverUserMessage(message: string): Promise<PiRpcDelivery> {

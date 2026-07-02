@@ -10,7 +10,8 @@ function createBinding(id: string): StoredChatBinding {
     workspacePath: `C:\\data\\${id}`,
     sessionId: `s-${id}`,
     sessionDir: `C:\\data\\${id}\\.pi-sessions`,
-    inboxDir: `C:\\data\\${id}\\inbox`
+    inboxDir: `C:\\data\\${id}\\inbox`,
+    protectedRuntime: false
   };
 }
 
@@ -74,4 +75,3 @@ describe("ChatMessageQueue", () => {
     expect(starts.sort()).toEqual(["a", "b"]);
   });
 });
-

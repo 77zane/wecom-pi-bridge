@@ -2,12 +2,12 @@ import path from "node:path";
 import { z } from "zod";
 import type { WeComMediaType } from "@wecom/aibot-node-sdk";
 
-export const WECOM_FILE_PROTOCOL_VERSION = 1;
+export const WECOM_FILE_PROTOCOL_VERSION = 2;
 export const WECOM_FILE_PROTOCOL_INSTRUCTION = [
-  "平台能力说明：如果你需要让企业微信发送你生成的文件，请把文件写入当前 workspace 的 outbox/ 目录，并在最终回复末尾单独输出 JSON：",
+  "平台能力说明：如果你需要让企业微信发送你生成的文件，请把文件写入当前 workspace 的 outbox/ 目录，并在回复中单独输出这个 JSON 指令：",
   '{"wecom_files":[{"path":"outbox/文件名","type":"file"}]}',
-  "type 只能是 file、image、voice、video；path 必须是相对路径且位于 outbox/ 下。",
-  "这段 JSON 由桥接服务读取，不需要向用户解释。",
+  "type 固定使用 file；path 必须是相对路径且位于 outbox/ 下。",
+  "这段 JSON 由桥接服务从整段回复中读取，不要求必须是最后一行，不需要向用户解释。",
   "不要在面向用户的回复里暴露 outbox、inbox 或本地文件路径；如果需要提示用户，可以说“文件已发送，请查收。”"
 ].join("\n");
 

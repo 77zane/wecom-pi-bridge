@@ -374,4 +374,32 @@ describe("WeComBridge", () => {
       }
     ]);
   });
+
+  it("sends legacy non-file Pi directives as ordinary files", async () => {
+    const dataDir = await createTempDir();
+    const workspacePath = path.join(dataDir, "workspaces", "wecom", "bot-a", "single", "user-a");
+    const outboxPath = path.join(workspacePath, "outbox");
+    const filePath = path.join(outboxPath, "clip.mp4");
+    await mkdir(outboxPath, { recursive: true });
+    await writeFile(filePath, "video content", "utf8");
+    const store = new BindingStore(path.join(dataDir, "app.db"), dataDir);
+    stores.push(store);
+    const runtime = new FakeRuntime();
+    runtime.reply = '视频已发送，请查收。 {"wecom_files":[{"path":"outbox/clip.mp4","type":"video"}]}';
+    const sender = new FakeSender();
+    const bridge = createBridge({ store, runtime, sender });
+
+    await bridge.handleTextMessage(createTextMessage());
+
+    expect(sender.uploads).toHaveLength(1);
+    expect(sender.uploads[0]?.type).toBe("file");
+    expect(sender.uploads[0]?.filename).toBe("clip.mp4");
+    expect(sender.mediaMessages).toEqual([
+      {
+        chatId: "user-a",
+        type: "file",
+        mediaId: "media-1"
+      }
+    ]);
+  });
 });

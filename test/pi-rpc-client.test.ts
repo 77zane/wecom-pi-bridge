@@ -93,6 +93,79 @@ describe("PiRpcClient", () => {
     });
   });
 
+  it("sends model and thinking control commands over the same RPC channel", async () => {
+    const process = new FakePiProcess();
+    const client = new PiRpcClient(process);
+
+    const setModelPromise = client.setModel("deepseek", "deepseek-v4-pro");
+    const setModelRequest = await readJsonLine(process.stdin);
+    expect(setModelRequest).toMatchObject({
+      type: "set_model",
+      provider: "deepseek",
+      modelId: "deepseek-v4-pro"
+    });
+    writeResponse(process, setModelRequest, {
+      provider: "deepseek",
+      id: "deepseek-v4-pro",
+      api: "openai-completions"
+    });
+
+    await expect(setModelPromise).resolves.toMatchObject({
+      provider: "deepseek",
+      id: "deepseek-v4-pro"
+    });
+
+    const setThinkingPromise = client.setThinkingLevel("high");
+    const setThinkingRequest = await readJsonLine(process.stdin);
+    expect(setThinkingRequest).toMatchObject({
+      type: "set_thinking_level",
+      level: "high"
+    });
+    writeResponse(process, setThinkingRequest, null);
+
+    await expect(setThinkingPromise).resolves.toBeUndefined();
+  });
+
+  it("lists available models and forwards generic control commands without starting a user turn", async () => {
+    const process = new FakePiProcess();
+    const client = new PiRpcClient(process);
+
+    const modelsPromise = client.getAvailableModels();
+    const modelsRequest = await readJsonLine(process.stdin);
+    expect(modelsRequest).toMatchObject({
+      type: "get_available_models"
+    });
+    writeResponse(process, modelsRequest, {
+      models: [
+        {
+          provider: "deepseek",
+          id: "deepseek-v4-flash",
+          api: "openai-completions"
+        }
+      ]
+    });
+
+    await expect(modelsPromise).resolves.toEqual([
+      expect.objectContaining({
+        provider: "deepseek",
+        id: "deepseek-v4-flash"
+      })
+    ]);
+
+    const commandPromise = client.sendControlCommand({
+      type: "set_auto_compaction",
+      enabled: false
+    });
+    const commandRequest = await readJsonLine(process.stdin);
+    expect(commandRequest).toMatchObject({
+      type: "set_auto_compaction",
+      enabled: false
+    });
+    writeResponse(process, commandRequest, null);
+
+    await expect(commandPromise).resolves.toBeUndefined();
+  });
+
   it("uses prompt when Pi is idle", async () => {
     const process = new FakePiProcess();
     const client = new PiRpcClient(process);
@@ -150,6 +223,24 @@ describe("PiRpcClient", () => {
     expect(lastTextRequest).toMatchObject({
       type: "get_last_assistant_text"
     });
+  });
+
+  it("treats a missing last assistant text as an empty reply", async () => {
+    const process = new FakePiProcess();
+    const client = new PiRpcClient(process);
+
+    const resultPromise = client.runUserMessage("hello");
+    const stateRequest = await readJsonLine(process.stdin);
+    writeResponse(process, stateRequest, idleState);
+    const promptRequest = await readJsonLine(process.stdin);
+    writeResponse(process, promptRequest, null);
+
+    process.stdout.write(`${JSON.stringify({ type: "agent_end", messages: [], willRetry: false })}\n`);
+
+    const lastTextRequest = await readJsonLine(process.stdin);
+    writeResponse(process, lastTextRequest, {});
+
+    await expect(resultPromise).resolves.toBe("");
   });
 
   it("rejects cleanly when the process exits while delivering a message", async () => {

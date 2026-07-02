@@ -7,13 +7,13 @@ export interface WeComChatAddress {
   readonly botId: string;
   readonly kind: ChatKind;
   readonly externalChatId: string;
-  readonly senderUserId: string;
+  readonly senderUserId?: string | undefined;
   readonly replyChatId: string;
 }
 
 export interface ReplyChunkOptions {
   readonly chatKind: ChatKind;
-  readonly mentionUserId: string;
+  readonly mentionUserId?: string | undefined;
   readonly text: string;
   readonly maxBytes?: number;
 }
@@ -50,7 +50,9 @@ export function resolveChatAddress(message: BaseMessage): WeComChatAddress {
 
 export function buildMarkdownReplyChunks(options: ReplyChunkOptions): string[] {
   const maxBytes = options.maxBytes ?? DEFAULT_REPLY_MAX_BYTES;
-  const mentionPrefix = options.chatKind === "group" ? `<@${options.mentionUserId}>\n` : "";
+  const mentionPrefix = options.chatKind === "group" && options.mentionUserId !== undefined && options.mentionUserId.length > 0
+    ? `<@${options.mentionUserId}>\n`
+    : "";
 
   if (Buffer.byteLength(`${mentionPrefix}${options.text}`, "utf8") <= maxBytes) {
     return [`${mentionPrefix}${options.text}`];

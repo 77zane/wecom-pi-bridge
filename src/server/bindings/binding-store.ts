@@ -20,6 +20,7 @@ export interface BindingIdentity {
 export interface StoredChatBinding extends ChatBinding {
   readonly sessionDir: string;
   readonly inboxDir: string;
+  readonly protectedRuntime: boolean;
 }
 
 interface BindingRow {
@@ -28,10 +29,19 @@ interface BindingRow {
   readonly external_chat_id: string;
   readonly workspace_path: string;
   readonly session_id: string;
+  readonly protected_runtime: number;
 }
 
 interface ProtocolVersionRow {
   readonly wecom_file_protocol_version: number;
+}
+
+export interface RuntimePolicy {
+  readonly idleReapingEnabled: boolean;
+}
+
+interface SettingRow {
+  readonly value: string;
 }
 
 interface TableColumnRow {
@@ -90,7 +100,8 @@ export class BindingStore {
       kind: request.kind,
       external_chat_id: request.externalChatId,
       workspace_path: workspacePath,
-      session_id: sessionId
+      session_id: sessionId,
+      protected_runtime: 0
     });
   }
 
@@ -104,6 +115,22 @@ export class BindingStore {
     return this.toStoredBinding(row);
   }
 
+  delete(identity: BindingIdentity): StoredChatBinding | undefined {
+    const row = this.find(identity.botId, identity.kind, identity.externalChatId);
+    if (row === undefined) {
+      return undefined;
+    }
+
+    this.db
+      .prepare(
+        `DELETE FROM chat_bindings
+        WHERE bot_id = ? AND kind = ? AND external_chat_id = ?`
+      )
+      .run(identity.botId, identity.kind, identity.externalChatId);
+
+    return this.toStoredBinding(row);
+  }
+
   listAll(): StoredChatBinding[] {
     const rows = this.db
       .prepare(
@@ -112,13 +139,71 @@ export class BindingStore {
           kind,
           external_chat_id,
           workspace_path,
-          session_id
+          session_id,
+          protected_runtime
         FROM chat_bindings
         ORDER BY bot_id, kind, external_chat_id`
       )
       .all() as unknown as BindingRow[];
 
     return rows.map((row) => this.toStoredBinding(row));
+  }
+
+  getRuntimePolicy(): RuntimePolicy {
+    const row = this.db
+      .prepare(
+        `SELECT value
+        FROM admin_settings
+        WHERE key = 'idle_reaping_enabled'`
+      )
+      .get() as SettingRow | null | undefined;
+
+    return {
+      idleReapingEnabled: row?.value !== "false"
+    };
+  }
+
+  setRuntimePolicy(policy: RuntimePolicy): RuntimePolicy {
+    this.db
+      .prepare(
+        `INSERT INTO admin_settings (key, value, updated_at)
+        VALUES ('idle_reaping_enabled', ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+          value = excluded.value,
+          updated_at = excluded.updated_at`
+      )
+      .run(policy.idleReapingEnabled ? "true" : "false", new Date().toISOString());
+
+    return this.getRuntimePolicy();
+  }
+
+  isRuntimeProtected(identity: BindingIdentity): boolean {
+    const row = this.find(identity.botId, identity.kind, identity.externalChatId);
+    return row?.protected_runtime === 1;
+  }
+
+  setRuntimeProtection(identity: BindingIdentity, protectedRuntime: boolean): StoredChatBinding | undefined {
+    const row = this.find(identity.botId, identity.kind, identity.externalChatId);
+    if (row === undefined) {
+      return undefined;
+    }
+
+    this.db
+      .prepare(
+        `UPDATE chat_bindings
+        SET protected_runtime = ?,
+            updated_at = ?
+        WHERE bot_id = ? AND kind = ? AND external_chat_id = ?`
+      )
+      .run(
+        protectedRuntime ? 1 : 0,
+        new Date().toISOString(),
+        identity.botId,
+        identity.kind,
+        identity.externalChatId
+      );
+
+    return this.getByIdentity(identity);
   }
 
   hasWeComFileProtocol(identity: BindingIdentity, version: number): boolean {
@@ -158,12 +243,20 @@ export class BindingStore {
         workspace_path TEXT NOT NULL,
         session_id TEXT NOT NULL,
         wecom_file_protocol_version INTEGER NOT NULL DEFAULT 0,
+        protected_runtime INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         PRIMARY KEY (bot_id, kind, external_chat_id)
       );
+
+      CREATE TABLE IF NOT EXISTS admin_settings (
+        key TEXT NOT NULL PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
     `);
     this.ensureColumn("chat_bindings", "wecom_file_protocol_version", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("chat_bindings", "protected_runtime", "INTEGER NOT NULL DEFAULT 0");
   }
 
   private ensureColumn(tableName: string, columnName: string, definition: string): void {
@@ -183,7 +276,8 @@ export class BindingStore {
           kind,
           external_chat_id,
           workspace_path,
-          session_id
+          session_id,
+          protected_runtime
         FROM chat_bindings
         WHERE bot_id = ? AND kind = ? AND external_chat_id = ?`
       )
@@ -220,7 +314,8 @@ export class BindingStore {
       workspacePath: row.workspace_path,
       sessionId: row.session_id,
       sessionDir: join(row.workspace_path, ".pi-sessions"),
-      inboxDir: join(row.workspace_path, "inbox")
+      inboxDir: join(row.workspace_path, "inbox"),
+      protectedRuntime: row.protected_runtime === 1
     };
   }
 }

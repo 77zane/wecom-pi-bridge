@@ -1,0 +1,36 @@
+services:
+  wecom-pi-bridge:
+    build:
+      context: .
+      args:
+        PI_VERSION: ${PI_VERSION:-0.80.2}
+    image: wecom-pi-bridge:latest
+    container_name: wecom-pi-bridge
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000
+      DATA_DIR: /app/data
+      PI_COMMAND: ${PI_COMMAND:-pi}
+      MAX_PROCESSES: ${MAX_PROCESSES:-50}
+      IDLE_TIMEOUT_MS: ${IDLE_TIMEOUT_MS:-1800000}
+      WECOM_BOT_ID: ${WECOM_BOT_ID}
+      WECOM_BOT_SECRET: ${WECOM_BOT_SECRET}
+      WECOM_BOT_WS_URL: ${WECOM_BOT_WS_URL:-}
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      NO_PROXY: ""
+      no_proxy: ""
+    volumes:
+      - wecom-pi-bridge-data:/app/data
+      - /home/yzf/workspace:/workspace
+      # If the pi command is provided by the host, mount it and set PI_COMMAND=/usr/local/bin/pi.
+      # - /absolute/path/to/pi:/usr/local/bin/pi:ro
+
+volumes:
+  wecom-pi-bridge-data:
