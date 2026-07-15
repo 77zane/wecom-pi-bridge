@@ -11,7 +11,8 @@
 - Pi RPC 进程启动、复用、空闲回收和进程保护控制。
 - 文本、文件、图片、视频消息转发。
 - Pi 通过 `outbox/` 和 `wecom_files` 指令回传文件。
-- 运维控制台：会话状态、Pi 控制指令、session JSONL 查看、进程控制和定时任务。
+- 运维控制台：会话状态、Pi 控制指令、session JSONL 查看、新建/切换 session、启动参数、进程控制和定时任务。
+- 全局或 workspace 级 Pi 启动参数配置，支持原始 argv JSON。
 - 定时任务：全局或单 session 生效，支持 `once`、`cron`、手动立即执行、有序 `prompt` / `control` 步骤。
 - 结构化 JSON 日志。
 - Dockerfile 和 docker-compose 部署入口。
@@ -48,6 +49,7 @@ Workspace/.pi-sessions
 - `src/server/runtime/runtime-manager.ts`: Pi 进程生命周期管理。
 - `src/server/pi/pi-rpc-client.ts`: Pi JSONL RPC 客户端。
 - `src/server/bindings/binding-store.ts`: 会话绑定和运行策略。
+- `src/server/startup/`: Pi 启动参数校验和 bridge 内置启动提示文件。
 - `src/server/scheduler/`: 定时任务存储、cron 计算和执行器。
 - `src/server/admin/`: 运维会话控制服务。
 - `src/web/main.tsx`: 运维控制台前端。
@@ -129,7 +131,7 @@ data/
             outbox/
 ```
 
-`app.db` 保存会话绑定、运行策略和定时任务。Pi session 内容由 Pi 写入 `.pi-sessions/`。
+`app.db` 保存会话绑定、运行策略、启动参数和定时任务。Pi session 内容由 Pi 写入 `.pi-sessions/`。
 
 ## 消息流程
 
@@ -158,7 +160,15 @@ data/
 
 ## Pi 文件回传
 
-桥接服务会向 Pi 注入一次文件能力说明。该说明只是能力说明：当 Pi 需要让企业微信发送生成文件时，写入 `outbox/` 并在回复中输出 JSON 指令。
+桥接服务会在 Pi 进程启动时自动追加一段内置系统提示词，说明企业微信文件发送协议。当 Pi 需要让企业微信发送生成文件时，写入 `outbox/` 并在回复中输出 JSON 指令。
+
+这段说明通过 Pi 启动参数注入：
+
+```text
+--append-system-prompt <DATA_DIR>/startup-prompts/wecom-file-protocol.md
+```
+
+它不再被塞进第一条用户消息里，用户消息会原样进入 Pi。
 
 ```json
 {"wecom_files":[{"path":"outbox/report.xlsx","type":"file"}]}
@@ -170,6 +180,51 @@ data/
 - 推荐 `type: "file"`；旧的 `image`、`voice`、`video` 仍可解析，但实际按普通文件发送。
 - 桥接服务会扫描整段回复，不要求 JSON 必须是最后一行。
 - JSON 会从用户可见文本中剥离。
+
+## Pi 启动参数
+
+运维台支持配置 Pi 启动参数，格式是原始 argv JSON 字符串数组：
+
+```json
+[
+  "--model",
+  "opencode-go/glm-5.2",
+  "--thinking",
+  "high",
+  "--system-prompt",
+  "你是企业微信里的研发运维助手。"
+]
+```
+
+作用域：
+
+- 全局启动参数：所有 workspace 默认使用。
+- Workspace 启动参数：当前单聊或群聊 workspace 使用。
+
+Workspace 配置会覆盖全局配置。Workspace 保存 `[]` 表示覆盖全局但不追加管理员参数；清空 workspace 配置表示继承全局。
+
+bridge 固定控制这些参数，不允许管理员覆盖：
+
+```text
+--mode
+--session-id
+--session-dir
+--session
+--continue
+--resume
+--fork
+--no-session
+--name
+--print
+--export
+--list-models
+--help
+--version
+```
+
+其他 Pi 参数原样透传。`--system-prompt` / `--append-system-prompt` 可以传字符串，也可以传 Pi 进程所在容器内可读的文件路径。
+
+保存启动参数不会影响已运行进程；新进程启动时生效。运维台的“保存并重启”只重启对应 Pi 进程，不 reset workspace、不切 session、不修改 session JSONL；如果进程保护已开启，会重启后重新拉起。
 
 ## 定时任务
 
@@ -218,6 +273,9 @@ Web UI 提供：
 - 会话列表和运行状态。
 - 当前模型、thinking、pending、进程 PID。
 - 读取 Pi session JSONL。
+- 新建 Pi session，并把当前 workspace 绑定到新 session。
+- 切换当前 workspace 下已有 Pi session。
+- 全局或 workspace 级启动参数配置。
 - 全局或单 session 控制指令。
 - 进程保护、停止、终结和重置。
 - 全局或单 session 定时任务配置。
@@ -228,6 +286,14 @@ Web UI 提供：
 - `GET /api/chats`
 - `GET /api/session?chatKey=<chatKey>&sessionId=<sessionId>`
 - `GET /api/admin/sessions`
+- `GET /api/admin/startup-args`
+- `PUT /api/admin/startup-args`
+- `PUT /api/admin/sessions/:sessionKey/startup-args`
+- `DELETE /api/admin/sessions/:sessionKey/startup-args`
+- `POST /api/admin/sessions/restart`
+- `POST /api/admin/sessions/:sessionKey/restart`
+- `POST /api/admin/sessions/:sessionKey/new-session`
+- `POST /api/admin/sessions/:sessionKey/switch-session`
 - `POST /api/admin/sessions/control`
 - `POST /api/admin/sessions/:sessionKey/control`
 - `GET /api/admin/scheduled-tasks`

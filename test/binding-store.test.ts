@@ -86,6 +86,54 @@ describe("BindingStore", () => {
     expect(binding.externalChatId).toBe("..\\user/a");
   });
 
+  it("resolves startup args with workspace settings overriding global settings", async () => {
+    const dataDir = await createTempDir();
+    const store = new BindingStore(path.join(dataDir, "app.db"), dataDir);
+    stores.push(store);
+    const binding = store.getOrCreate({
+      botId: "bot-a",
+      kind: "single",
+      externalChatId: "user-a",
+      displayName: "User A"
+    });
+
+    expect(store.getGlobalStartupArgs()).toEqual([]);
+    expect(store.getResolvedStartupArgs(binding)).toMatchObject({
+      source: "none",
+      args: [],
+      workspaceArgs: null
+    });
+
+    store.setGlobalStartupArgs(["--model", "opencode-go/glm-5.2"]);
+    expect(store.getResolvedStartupArgs(binding)).toMatchObject({
+      source: "global",
+      args: ["--model", "opencode-go/glm-5.2"],
+      globalArgs: ["--model", "opencode-go/glm-5.2"],
+      workspaceArgs: null
+    });
+
+    store.setWorkspaceStartupArgs(binding, []);
+    expect(store.getResolvedStartupArgs(binding)).toMatchObject({
+      source: "workspace",
+      args: [],
+      workspaceArgs: []
+    });
+
+    store.setWorkspaceStartupArgs(binding, ["--thinking", "high"]);
+    expect(store.getResolvedStartupArgs(binding)).toMatchObject({
+      source: "workspace",
+      args: ["--thinking", "high"],
+      workspaceArgs: ["--thinking", "high"]
+    });
+
+    store.clearWorkspaceStartupArgs(binding);
+    expect(store.getResolvedStartupArgs(binding)).toMatchObject({
+      source: "global",
+      args: ["--model", "opencode-go/glm-5.2"],
+      workspaceArgs: null
+    });
+  });
+
   it("persists the WeCom file protocol injection version per binding", async () => {
     const dataDir = await createTempDir();
     const dbPath = path.join(dataDir, "app.db");
@@ -102,5 +150,30 @@ describe("BindingStore", () => {
     store.markWeComFileProtocol(binding, 1);
     expect(store.hasWeComFileProtocol(binding, 1)).toBe(true);
     expect(store.hasWeComFileProtocol(binding, 2)).toBe(false);
+  });
+
+  it("updates a binding session id and resets the file protocol marker", async () => {
+    const dataDir = await createTempDir();
+    const store = new BindingStore(path.join(dataDir, "app.db"), dataDir);
+    stores.push(store);
+    const binding = store.getOrCreate({
+      botId: "bot-a",
+      kind: "single",
+      externalChatId: "user-a",
+      displayName: "User A"
+    });
+    store.markWeComFileProtocol(binding, 2);
+
+    const updated = store.setSessionId(binding, "s-new-session");
+
+    expect(updated).toMatchObject({
+      botId: binding.botId,
+      kind: binding.kind,
+      externalChatId: binding.externalChatId,
+      workspacePath: binding.workspacePath,
+      sessionId: "s-new-session"
+    });
+    expect(store.hasWeComFileProtocol(binding, 1)).toBe(false);
+    expect(store.getByIdentity(binding)?.sessionId).toBe("s-new-session");
   });
 });

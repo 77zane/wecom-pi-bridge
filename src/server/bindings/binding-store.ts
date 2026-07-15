@@ -3,6 +3,11 @@ import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { ChatBinding, ChatKind } from "../../shared/contracts.js";
+import {
+  parseStoredStartupArgs,
+  serializeStartupArgs,
+  type ResolvedStartupArgs
+} from "../startup/startup-args.js";
 
 export interface BindingRequest {
   readonly botId: string;
@@ -21,6 +26,7 @@ export interface StoredChatBinding extends ChatBinding {
   readonly sessionDir: string;
   readonly inboxDir: string;
   readonly protectedRuntime: boolean;
+  readonly startupArgs: string[] | null;
 }
 
 interface BindingRow {
@@ -30,6 +36,7 @@ interface BindingRow {
   readonly workspace_path: string;
   readonly session_id: string;
   readonly protected_runtime: number;
+  readonly startup_args_json: string | null;
 }
 
 interface ProtocolVersionRow {
@@ -51,6 +58,7 @@ interface TableColumnRow {
 export class BindingStore {
   private readonly db: DatabaseSync;
   private readonly dataDir: string;
+  private static readonly GLOBAL_STARTUP_ARGS_KEY = "pi_startup_args_global";
 
   constructor(dbPath: string, dataDir: string) {
     mkdirSync(dirname(dbPath), { recursive: true });
@@ -101,7 +109,8 @@ export class BindingStore {
       external_chat_id: request.externalChatId,
       workspace_path: workspacePath,
       session_id: sessionId,
-      protected_runtime: 0
+      protected_runtime: 0,
+      startup_args_json: null
     });
   }
 
@@ -140,7 +149,8 @@ export class BindingStore {
           external_chat_id,
           workspace_path,
           session_id,
-          protected_runtime
+          protected_runtime,
+          startup_args_json
         FROM chat_bindings
         ORDER BY bot_id, kind, external_chat_id`
       )
@@ -177,6 +187,94 @@ export class BindingStore {
     return this.getRuntimePolicy();
   }
 
+  getGlobalStartupArgs(): string[] {
+    const row = this.db
+      .prepare(
+        `SELECT value
+        FROM admin_settings
+        WHERE key = ?`
+      )
+      .get(BindingStore.GLOBAL_STARTUP_ARGS_KEY) as SettingRow | null | undefined;
+
+    return parseStoredStartupArgs(row?.value);
+  }
+
+  setGlobalStartupArgs(args: readonly string[]): string[] {
+    const serialized = serializeStartupArgs(args);
+    this.db
+      .prepare(
+        `INSERT INTO admin_settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+          value = excluded.value,
+          updated_at = excluded.updated_at`
+      )
+      .run(BindingStore.GLOBAL_STARTUP_ARGS_KEY, serialized, new Date().toISOString());
+
+    return this.getGlobalStartupArgs();
+  }
+
+  setWorkspaceStartupArgs(identity: BindingIdentity, args: readonly string[]): StoredChatBinding | undefined {
+    const row = this.find(identity.botId, identity.kind, identity.externalChatId);
+    if (row === undefined) {
+      return undefined;
+    }
+
+    this.db
+      .prepare(
+        `UPDATE chat_bindings
+        SET startup_args_json = ?,
+            updated_at = ?
+        WHERE bot_id = ? AND kind = ? AND external_chat_id = ?`
+      )
+      .run(serializeStartupArgs(args), new Date().toISOString(), identity.botId, identity.kind, identity.externalChatId);
+
+    return this.getByIdentity(identity);
+  }
+
+  clearWorkspaceStartupArgs(identity: BindingIdentity): StoredChatBinding | undefined {
+    const row = this.find(identity.botId, identity.kind, identity.externalChatId);
+    if (row === undefined) {
+      return undefined;
+    }
+
+    this.db
+      .prepare(
+        `UPDATE chat_bindings
+        SET startup_args_json = NULL,
+            updated_at = ?
+        WHERE bot_id = ? AND kind = ? AND external_chat_id = ?`
+      )
+      .run(new Date().toISOString(), identity.botId, identity.kind, identity.externalChatId);
+
+    return this.getByIdentity(identity);
+  }
+
+  getResolvedStartupArgs(identity: BindingIdentity): ResolvedStartupArgs | undefined {
+    const binding = this.getByIdentity(identity);
+    if (binding === undefined) {
+      return undefined;
+    }
+
+    const globalArgs = this.getGlobalStartupArgs();
+    const workspaceArgs = binding.startupArgs;
+    if (workspaceArgs !== null) {
+      return {
+        source: "workspace",
+        args: workspaceArgs,
+        globalArgs,
+        workspaceArgs
+      };
+    }
+
+    return {
+      source: globalArgs.length > 0 ? "global" : "none",
+      args: globalArgs,
+      globalArgs,
+      workspaceArgs
+    };
+  }
+
   isRuntimeProtected(identity: BindingIdentity): boolean {
     const row = this.find(identity.botId, identity.kind, identity.externalChatId);
     return row?.protected_runtime === 1;
@@ -202,6 +300,25 @@ export class BindingStore {
         identity.kind,
         identity.externalChatId
       );
+
+    return this.getByIdentity(identity);
+  }
+
+  setSessionId(identity: BindingIdentity, sessionId: string): StoredChatBinding | undefined {
+    const row = this.find(identity.botId, identity.kind, identity.externalChatId);
+    if (row === undefined) {
+      return undefined;
+    }
+
+    this.db
+      .prepare(
+        `UPDATE chat_bindings
+        SET session_id = ?,
+            wecom_file_protocol_version = 0,
+            updated_at = ?
+        WHERE bot_id = ? AND kind = ? AND external_chat_id = ?`
+      )
+      .run(sessionId, new Date().toISOString(), identity.botId, identity.kind, identity.externalChatId);
 
     return this.getByIdentity(identity);
   }
@@ -244,6 +361,7 @@ export class BindingStore {
         session_id TEXT NOT NULL,
         wecom_file_protocol_version INTEGER NOT NULL DEFAULT 0,
         protected_runtime INTEGER NOT NULL DEFAULT 0,
+        startup_args_json TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         PRIMARY KEY (bot_id, kind, external_chat_id)
@@ -257,6 +375,7 @@ export class BindingStore {
     `);
     this.ensureColumn("chat_bindings", "wecom_file_protocol_version", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("chat_bindings", "protected_runtime", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("chat_bindings", "startup_args_json", "TEXT");
   }
 
   private ensureColumn(tableName: string, columnName: string, definition: string): void {
@@ -277,7 +396,8 @@ export class BindingStore {
           external_chat_id,
           workspace_path,
           session_id,
-          protected_runtime
+          protected_runtime,
+          startup_args_json
         FROM chat_bindings
         WHERE bot_id = ? AND kind = ? AND external_chat_id = ?`
       )
@@ -315,7 +435,8 @@ export class BindingStore {
       sessionId: row.session_id,
       sessionDir: join(row.workspace_path, ".pi-sessions"),
       inboxDir: join(row.workspace_path, "inbox"),
-      protectedRuntime: row.protected_runtime === 1
+      protectedRuntime: row.protected_runtime === 1,
+      startupArgs: row.startup_args_json === null ? null : parseStoredStartupArgs(row.startup_args_json)
     };
   }
 }

@@ -1,14 +1,12 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { SendMsgBody, WeComMediaType } from "@wecom/aibot-node-sdk";
-import type { BindingStore, StoredChatBinding } from "../bindings/binding-store.js";
+import type { StoredChatBinding } from "../bindings/binding-store.js";
 import { logInfo, logWarn } from "../logging.js";
 import type { ChatMessageQueue } from "../runtime/chat-message-queue.js";
 import {
-  addWeComFileProtocolInstruction,
   extractWeComFileDirectives,
   resolveOutboundFilePath,
-  WECOM_FILE_PROTOCOL_VERSION,
   type WeComFileDirective
 } from "./outbound-file-protocol.js";
 import { buildMarkdownReplyChunks, type WeComChatAddress } from "./wecom-message.js";
@@ -28,7 +26,6 @@ export interface WeComSender {
 
 export class ConversationDispatcher {
   constructor(
-    private readonly bindingStore: BindingStore,
     private readonly queue: ChatMessageQueue,
     private readonly runtime: PiRuntimeRunner,
     private readonly sender: WeComSender
@@ -41,15 +38,7 @@ export class ConversationDispatcher {
     });
 
     const replyText = await this.queue.run(binding, async () => {
-      const shouldInjectProtocol = !this.bindingStore.hasWeComFileProtocol(binding, WECOM_FILE_PROTOCOL_VERSION);
-      const runtimePrompt = shouldInjectProtocol ? addWeComFileProtocolInstruction(prompt) : prompt;
-      const reply = await this.runtime.runMessage(binding, runtimePrompt);
-
-      if (shouldInjectProtocol) {
-        this.bindingStore.markWeComFileProtocol(binding, WECOM_FILE_PROTOCOL_VERSION);
-      }
-
-      return reply;
+      return this.runtime.runMessage(binding, prompt);
     });
     const extractedReply = extractWeComFileDirectives(replyText);
 

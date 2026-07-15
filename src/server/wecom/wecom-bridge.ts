@@ -52,7 +52,7 @@ export class WeComBridge {
     this.sender = options.sender;
     this.downloader = options.downloader;
     this.createAttachmentSuffix = options.createAttachmentSuffix ?? (() => randomUUID().slice(0, 8));
-    this.dispatcher = options.dispatcher ?? new ConversationDispatcher(this.bindingStore, this.queue, this.runtime, this.sender);
+    this.dispatcher = options.dispatcher ?? new ConversationDispatcher(this.queue, this.runtime, this.sender);
   }
 
   async handleTextMessage(message: TextMessage): Promise<void> {

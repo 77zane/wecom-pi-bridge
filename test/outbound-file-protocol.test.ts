@@ -1,21 +1,11 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-  addWeComFileProtocolInstruction,
   extractWeComFileDirectives,
   resolveOutboundFilePath
 } from "../src/server/wecom/outbound-file-protocol.js";
 
 describe("outbound file protocol", () => {
-  it("adds the file protocol instruction before the first user message", () => {
-    const prompt = addWeComFileProtocolInstruction("请生成报表");
-
-    expect(prompt).toContain("平台能力说明");
-    expect(prompt).toContain("不要在面向用户的回复里暴露 outbox、inbox 或本地文件路径");
-    expect(prompt).toContain('{"wecom_files":[{"path":"outbox/文件名","type":"file"}]}');
-    expect(prompt.endsWith("请生成报表")).toBe(true);
-  });
-
   it("extracts a fenced file directive and removes it from reply text", () => {
     const reply = [
       "文件已发送，请查收。",

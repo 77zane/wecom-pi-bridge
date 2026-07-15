@@ -11,7 +11,8 @@
 - Pi RPC process spawning, reuse, idle cleanup, and protected-runtime controls.
 - Text, file, image, and video message forwarding.
 - Outbound file delivery through `outbox/` and `wecom_files`.
-- Operations console for session state, Pi control commands, session JSONL browsing, process control, and scheduled tasks.
+- Operations console for session state, Pi control commands, session JSONL browsing, new/switch session, startup args, process control, and scheduled tasks.
+- Global or workspace-scoped Pi startup args using raw argv JSON.
 - Scheduled tasks with global or single-session scope, `once`, `cron`, manual run-now, and ordered `prompt` / `control` steps.
 - Structured JSON logs.
 - Dockerfile and docker-compose deployment entry points.
@@ -48,6 +49,7 @@ Main modules:
 - `src/server/runtime/runtime-manager.ts`: Pi process lifecycle management.
 - `src/server/pi/pi-rpc-client.ts`: Pi JSONL RPC client.
 - `src/server/bindings/binding-store.ts`: chat bindings and runtime policy.
+- `src/server/startup/`: Pi startup-arg validation and bridge-owned startup prompt file.
 - `src/server/scheduler/`: scheduled task store, cron calculation, and executor.
 - `src/server/admin/`: admin session control service.
 - `src/web/main.tsx`: operations console frontend.
@@ -129,7 +131,7 @@ data/
             outbox/
 ```
 
-`app.db` stores chat bindings, runtime policy, and scheduled tasks. Pi writes session content under `.pi-sessions/`.
+`app.db` stores chat bindings, runtime policy, startup args, and scheduled tasks. Pi writes session content under `.pi-sessions/`.
 
 ## Message Flow
 
@@ -158,7 +160,15 @@ Voice callbacks are handled as `voice.content` text from the SDK. Audio files su
 
 ## Pi Outbound Files
 
-The bridge injects a file capability note once per chat. This is a capability note: when Pi needs WeCom to send a generated file, it writes the file under `outbox/` and outputs a JSON directive.
+The bridge appends a bridge-owned system prompt when a Pi process starts. That prompt describes the WeCom outbound file protocol: when Pi needs WeCom to send a generated file, it writes the file under `outbox/` and outputs a JSON directive.
+
+The prompt is injected through Pi startup args:
+
+```text
+--append-system-prompt <DATA_DIR>/startup-prompts/wecom-file-protocol.md
+```
+
+It is no longer injected into the first user message; user prompts are forwarded unchanged.
 
 ```json
 {"wecom_files":[{"path":"outbox/report.xlsx","type":"file"}]}
@@ -170,6 +180,51 @@ Rules:
 - Prefer `type: "file"`. Legacy `image`, `voice`, and `video` directives are still accepted but are sent as ordinary file attachments.
 - The bridge scans the whole reply; the JSON does not have to be the final line.
 - The JSON is removed from user-facing text.
+
+## Pi Startup Args
+
+The operations console can configure Pi startup args as raw argv JSON:
+
+```json
+[
+  "--model",
+  "opencode-go/glm-5.2",
+  "--thinking",
+  "high",
+  "--system-prompt",
+  "You are a WeCom engineering and operations assistant."
+]
+```
+
+Scopes:
+
+- Global startup args: default for every workspace.
+- Workspace startup args: applies to the selected single-chat or group workspace.
+
+Workspace args override global args. Saving `[]` at workspace scope means "override global with no extra admin args"; clearing workspace args means "inherit global".
+
+The bridge owns and blocks these args because they are required for RPC/session binding:
+
+```text
+--mode
+--session-id
+--session-dir
+--session
+--continue
+--resume
+--fork
+--no-session
+--name
+--print
+--export
+--list-models
+--help
+--version
+```
+
+Other Pi args are passed through as-is. `--system-prompt` and `--append-system-prompt` may receive either literal text or a file path readable by the Pi process in its runtime environment.
+
+Saving startup args does not affect already-running Pi processes; the next process start uses the new args. "Save and restart" restarts the relevant Pi process only. It does not reset the workspace, switch sessions, or edit session JSONL; if protected runtime is enabled, the process is restarted immediately after shutdown.
 
 ## Scheduled Tasks
 
@@ -218,6 +273,9 @@ The Web UI provides:
 - Session list and runtime state.
 - Current model, thinking level, pending count, and PID.
 - Pi session JSONL browsing.
+- Create a new Pi session and bind the current workspace to it.
+- Switch the current workspace to an existing Pi session file.
+- Global or workspace-scoped startup arg configuration.
 - Global or single-session control commands.
 - Runtime protection, stop, terminate, and reset.
 - Global or single-session scheduled task configuration.
@@ -228,6 +286,14 @@ Main APIs:
 - `GET /api/chats`
 - `GET /api/session?chatKey=<chatKey>&sessionId=<sessionId>`
 - `GET /api/admin/sessions`
+- `GET /api/admin/startup-args`
+- `PUT /api/admin/startup-args`
+- `PUT /api/admin/sessions/:sessionKey/startup-args`
+- `DELETE /api/admin/sessions/:sessionKey/startup-args`
+- `POST /api/admin/sessions/restart`
+- `POST /api/admin/sessions/:sessionKey/restart`
+- `POST /api/admin/sessions/:sessionKey/new-session`
+- `POST /api/admin/sessions/:sessionKey/switch-session`
 - `POST /api/admin/sessions/control`
 - `POST /api/admin/sessions/:sessionKey/control`
 - `GET /api/admin/scheduled-tasks`

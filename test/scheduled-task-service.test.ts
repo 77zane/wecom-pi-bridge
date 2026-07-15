@@ -122,7 +122,7 @@ describe("ScheduledTaskService", () => {
     });
     const queue = new ChatMessageQueue();
     const sender = new FakeSender();
-    const dispatcher = new ConversationDispatcher(bindingStore, queue, runtime, sender);
+    const dispatcher = new ConversationDispatcher(queue, runtime, sender);
     const service = new ScheduledTaskService(taskStore, bindingStore, runtime);
     service.setDispatcher(dispatcher);
     const task = taskStore.createTask({
