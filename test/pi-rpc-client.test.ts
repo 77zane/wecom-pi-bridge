@@ -78,6 +78,40 @@ describe("PiRpcClient", () => {
     ).toEqual(["--mode", "rpc", "--session-id", "s-abc", "--session-dir", "C:\\data\\sessions", "--name", "User A"]);
   });
 
+  it("appends validated startup args after bridge-owned RPC args", () => {
+    expect(
+      buildPiRpcArgs({
+        sessionId: "s-abc",
+        sessionDir: "/data/sessions",
+        sessionName: "User A",
+        startupArgs: ["--model", "opencode-go/glm-5.2", "--thinking", "high"]
+      })
+    ).toEqual([
+      "--mode",
+      "rpc",
+      "--session-id",
+      "s-abc",
+      "--session-dir",
+      "/data/sessions",
+      "--name",
+      "User A",
+      "--model",
+      "opencode-go/glm-5.2",
+      "--thinking",
+      "high"
+    ]);
+  });
+
+  it("rejects startup args that would override bridge-owned session controls", () => {
+    expect(() =>
+      buildPiRpcArgs({
+        sessionId: "s-abc",
+        sessionDir: "/data/sessions",
+        startupArgs: ["--session-id", "s-other"]
+      })
+    ).toThrow("controlled by bridge");
+  });
+
   it("sends get_state and resolves the correlated response", async () => {
     const process = new FakePiProcess();
     const client = new PiRpcClient(process);

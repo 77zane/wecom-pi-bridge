@@ -37,6 +37,8 @@ class FakeManagedPiClient implements ManagedPiClient {
   readonly pid = 4321;
   readonly controlCommands: PiRpcControlCommand[] = [];
   readonly shutdownReasons: string[] = [];
+  nextNewSessionId = "s-new";
+  nextSwitchSessionId = "s-switched";
   private readonly exitListeners = new Set<() => void>();
   killed = false;
   state: PiRpcState = {
@@ -69,6 +71,9 @@ class FakeManagedPiClient implements ManagedPiClient {
 
   async sendControlCommand(command: PiRpcControlCommand): Promise<unknown> {
     this.controlCommands.push(command);
+    if (command.type === "get_state") {
+      return this.state;
+    }
     if (command.type === "set_model") {
       this.state = {
         ...this.state,
@@ -78,6 +83,24 @@ class FakeManagedPiClient implements ManagedPiClient {
         }
       };
       return this.state.model;
+    }
+    if (command.type === "new_session") {
+      this.state = {
+        ...this.state,
+        sessionId: this.nextNewSessionId,
+        sessionFile: `/sessions/${this.nextNewSessionId}.jsonl`,
+        messageCount: 0,
+        pendingMessageCount: 0
+      };
+      return undefined;
+    }
+    if (command.type === "switch_session") {
+      this.state = {
+        ...this.state,
+        sessionId: this.nextSwitchSessionId,
+        sessionFile: command.sessionPath
+      };
+      return undefined;
     }
 
     return undefined;
@@ -380,6 +403,88 @@ describe("admin session API", () => {
     store.close();
   });
 
+  it("updates global and workspace startup args through the admin API", async () => {
+    const dataDir = await createTempDir();
+    const store = new BindingStore(path.join(dataDir, "app.db"), dataDir);
+    const binding = store.getOrCreate({
+      botId: "bot-a",
+      kind: "single",
+      externalChatId: "startup-user",
+      displayName: "Startup User"
+    });
+    const app = createApp(createConfig(dataDir), {
+      bindingStore: store,
+      queue: new ChatMessageQueue()
+    });
+
+    const globalResponse = await app.inject({
+      method: "PUT",
+      url: "/api/admin/startup-args",
+      payload: {
+        args: ["--model", "opencode-go/glm-5.2"]
+      }
+    });
+    expect(globalResponse.statusCode).toBe(200);
+    expect(globalResponse.json()).toMatchObject({
+      startupArgs: {
+        args: ["--model", "opencode-go/glm-5.2"]
+      }
+    });
+
+    const inheritedResponse = await app.inject({ method: "GET", url: "/api/admin/sessions" });
+    expect(inheritedResponse.statusCode).toBe(200);
+    expect(inheritedResponse.json()).toMatchObject({
+      startupArgs: {
+        args: ["--model", "opencode-go/glm-5.2"]
+      },
+      sessions: [
+        {
+          startup: {
+            source: "global",
+            args: ["--model", "opencode-go/glm-5.2"],
+            workspaceArgs: null
+          }
+        }
+      ]
+    });
+
+    const workspaceResponse = await app.inject({
+      method: "PUT",
+      url: `/api/admin/sessions/${encodeURIComponent(encodeChatKey(binding))}/startup-args`,
+      payload: {
+        args: ["--thinking", "high"]
+      }
+    });
+    expect(workspaceResponse.statusCode).toBe(200);
+    expect(store.getResolvedStartupArgs(binding)).toMatchObject({
+      source: "workspace",
+      args: ["--thinking", "high"]
+    });
+
+    const blockedResponse = await app.inject({
+      method: "PUT",
+      url: "/api/admin/startup-args",
+      payload: {
+        args: ["--session-id", "s-other"]
+      }
+    });
+    expect(blockedResponse.statusCode).toBe(400);
+
+    const clearResponse = await app.inject({
+      method: "DELETE",
+      url: `/api/admin/sessions/${encodeURIComponent(encodeChatKey(binding))}/startup-args`
+    });
+    expect(clearResponse.statusCode).toBe(200);
+    expect(store.getResolvedStartupArgs(binding)).toMatchObject({
+      source: "global",
+      args: ["--model", "opencode-go/glm-5.2"],
+      workspaceArgs: null
+    });
+
+    await app.close();
+    store.close();
+  });
+
   it("protects a session by starting its runtime, and stop kills the process while preserving data", async () => {
     const dataDir = await createTempDir();
     const store = new BindingStore(path.join(dataDir, "app.db"), dataDir);
@@ -456,6 +561,137 @@ describe("admin session API", () => {
     expect(store.getByIdentity(binding)?.protectedRuntime).toBe(false);
     expect(store.listAll()).toHaveLength(1);
     expect(existsSync(binding.workspacePath)).toBe(true);
+
+    await app.close();
+    store.close();
+  });
+
+  it("creates a new Pi session and updates the bridge binding without clearing workspace data", async () => {
+    const dataDir = await createTempDir();
+    const store = new BindingStore(path.join(dataDir, "app.db"), dataDir);
+    const binding = store.getOrCreate({
+      botId: "bot-a",
+      kind: "single",
+      externalChatId: "user-a",
+      displayName: "User A"
+    });
+    await writeFile(path.join(binding.workspacePath, "kept.txt"), "kept", "utf8");
+    store.markWeComFileProtocol(binding, 2);
+    const client = new FakeManagedPiClient();
+    client.nextNewSessionId = "s-new-session";
+    const runtime = new RuntimeManager({
+      maxProcesses: 50,
+      idleTimeoutMs: 30 * 60 * 1000,
+      clientFactory: async () => client
+    });
+    await runtime.runMessage(binding, "warm runtime");
+    const app = createApp(createConfig(dataDir), {
+      bindingStore: store,
+      runtime,
+      queue: new ChatMessageQueue()
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/admin/sessions/${encodeURIComponent(encodeChatKey(binding))}/new-session`
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      session: {
+        sessionKey: encodeChatKey(binding),
+        previousSessionId: binding.sessionId,
+        sessionId: "s-new-session",
+        sessionFile: "/sessions/s-new-session.jsonl",
+        startedRuntime: false,
+        stoppedRuntime: false
+      }
+    });
+    expect(store.getByIdentity(binding)?.sessionId).toBe("s-new-session");
+    expect(store.hasWeComFileProtocol(binding, 1)).toBe(false);
+    expect(existsSync(path.join(binding.workspacePath, "kept.txt"))).toBe(true);
+    expect(runtime.activeCount).toBe(1);
+    expect(client.controlCommands.map((command) => command.type)).toEqual(["new_session", "get_state"]);
+
+    const listResponse = await app.inject({ method: "GET", url: "/api/admin/sessions" });
+    expect(listResponse.statusCode).toBe(200);
+    expect(listResponse.json()).toMatchObject({
+      sessions: [
+        {
+          binding: {
+            sessionId: "s-new-session"
+          },
+          runtime: {
+            status: "running",
+            state: {
+              sessionId: "s-new-session"
+            }
+          }
+        }
+      ]
+    });
+
+    await app.close();
+    store.close();
+  });
+
+  it("switches to an existing session file, updates the binding, and stops a transient runtime", async () => {
+    const dataDir = await createTempDir();
+    const store = new BindingStore(path.join(dataDir, "app.db"), dataDir);
+    const binding = store.getOrCreate({
+      botId: "bot-a",
+      kind: "single",
+      externalChatId: "user-a",
+      displayName: "User A"
+    });
+    const targetFile = path.join(binding.sessionDir, "target.jsonl");
+    await writeFile(targetFile, `${JSON.stringify({ type: "session", id: "s-target-session" })}\n`, "utf8");
+    store.markWeComFileProtocol(binding, 2);
+    const client = new FakeManagedPiClient();
+    client.nextSwitchSessionId = "s-target-session";
+    const runtime = new RuntimeManager({
+      maxProcesses: 50,
+      idleTimeoutMs: 30 * 60 * 1000,
+      clientFactory: async () => client
+    });
+    const app = createApp(createConfig(dataDir), {
+      bindingStore: store,
+      runtime,
+      queue: new ChatMessageQueue()
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/admin/sessions/${encodeURIComponent(encodeChatKey(binding))}/switch-session`,
+      payload: {
+        sessionId: "s-target-session"
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      session: {
+        sessionKey: encodeChatKey(binding),
+        previousSessionId: binding.sessionId,
+        sessionId: "s-target-session",
+        sessionFile: targetFile,
+        startedRuntime: true,
+        stoppedRuntime: true
+      }
+    });
+    expect(store.getByIdentity(binding)?.sessionId).toBe("s-target-session");
+    expect(store.hasWeComFileProtocol(binding, 1)).toBe(false);
+    expect(client.killed).toBe(true);
+    expect(runtime.activeCount).toBe(0);
+    expect(client.controlCommands).toEqual([
+      {
+        type: "switch_session",
+        sessionPath: targetFile
+      },
+      {
+        type: "get_state"
+      }
+    ]);
 
     await app.close();
     store.close();

@@ -19,6 +19,7 @@ import {
   listSessionSummaries,
   type SessionSummaryView
 } from "../sessions/session-reader.js";
+import type { ResolvedStartupArgs } from "../startup/startup-args.js";
 
 export interface AdminSessionRuntimeView {
   readonly status: "running" | "stopped";
@@ -34,6 +35,7 @@ export interface AdminSessionView {
   readonly sessionKey: string;
   readonly binding: StoredChatBinding;
   readonly runtime: AdminSessionRuntimeView;
+  readonly startup: ResolvedStartupArgs;
   readonly sessions: SessionSummaryView[];
 }
 
@@ -58,6 +60,23 @@ export interface SessionProtectionResult {
   readonly pid?: number | undefined;
 }
 
+export interface SessionRestartResult {
+  readonly sessionKey: string;
+  readonly stoppedRuntime: boolean;
+  readonly protectedRuntime: boolean;
+  readonly startedRuntime: boolean;
+  readonly pid?: number | undefined;
+}
+
+export interface SessionRebindResult {
+  readonly sessionKey: string;
+  readonly previousSessionId: string;
+  readonly sessionId: string;
+  readonly sessionFile: string | null;
+  readonly startedRuntime: boolean;
+  readonly stoppedRuntime: boolean;
+}
+
 export interface BroadcastControlResult {
   readonly sessionKey: string;
   readonly status: "ok" | "skipped" | "error";
@@ -77,6 +96,10 @@ export interface TerminateSessionResult {
   readonly error?: string | undefined;
 }
 
+export interface StartupArgsUpdateResult {
+  readonly args: string[];
+}
+
 export class AdminSessionService {
   constructor(
     private readonly bindingStore: BindingStore,
@@ -93,6 +116,12 @@ export class AdminSessionService {
         sessionKey: encodeChatKey(binding),
         binding,
         runtime: toRuntimeView(runtimeEntries.get(getBindingKey(binding))),
+        startup: this.bindingStore.getResolvedStartupArgs(binding) ?? {
+          source: "none",
+          args: [],
+          globalArgs: [],
+          workspaceArgs: null
+        },
         sessions: await listSessionSummaries(binding.sessionDir)
       }))
     );
@@ -104,6 +133,36 @@ export class AdminSessionService {
 
   setRuntimePolicy(policy: RuntimePolicy): RuntimePolicy {
     return this.bindingStore.setRuntimePolicy(policy);
+  }
+
+  getGlobalStartupArgs(): StartupArgsUpdateResult {
+    return {
+      args: this.bindingStore.getGlobalStartupArgs()
+    };
+  }
+
+  setGlobalStartupArgs(args: readonly string[]): StartupArgsUpdateResult {
+    return {
+      args: this.bindingStore.setGlobalStartupArgs(args)
+    };
+  }
+
+  setWorkspaceStartupArgs(sessionKey: string, args: readonly string[]): StoredChatBinding | undefined {
+    const identity = this.decodeSessionKey(sessionKey);
+    if (identity === undefined) {
+      return undefined;
+    }
+
+    return this.bindingStore.setWorkspaceStartupArgs(identity, args);
+  }
+
+  clearWorkspaceStartupArgs(sessionKey: string): StoredChatBinding | undefined {
+    const identity = this.decodeSessionKey(sessionKey);
+    if (identity === undefined) {
+      return undefined;
+    }
+
+    return this.bindingStore.clearWorkspaceStartupArgs(identity);
   }
 
   async sendControlCommand(sessionKey: string, command: PiRpcControlCommand): Promise<RuntimeControlResult> {
@@ -189,6 +248,76 @@ export class AdminSessionService {
       startedRuntime: ensured?.startedRuntime ?? false,
       pid: ensured?.pid
     };
+  }
+
+  async restartSessionRuntime(sessionKey: string): Promise<SessionRestartResult | undefined> {
+    const identity = this.decodeSessionKey(sessionKey);
+    if (identity === undefined) {
+      return undefined;
+    }
+
+    const binding = this.bindingStore.getByIdentity(identity);
+    if (binding === undefined) {
+      return undefined;
+    }
+
+    return this.restartBindingRuntime(binding);
+  }
+
+  async restartRuntimes(scope: "running" | "all"): Promise<SessionRestartResult[]> {
+    if (scope === "all") {
+      const results: SessionRestartResult[] = [];
+      for (const binding of this.bindingStore.listAll()) {
+        results.push(await this.restartBindingRuntime(binding));
+      }
+
+      return results;
+    }
+
+    if (this.runtime === undefined) {
+      return [];
+    }
+
+    const entries = await this.runtime.listEntries();
+    const results: SessionRestartResult[] = [];
+    for (const entry of entries) {
+      results.push(await this.restartBindingRuntime(entry.binding));
+    }
+
+    return results;
+  }
+
+  async createAndBindNewSession(sessionKey: string, parentSession?: string | undefined): Promise<SessionRebindResult | undefined> {
+    const binding = this.getBindingBySessionKey(sessionKey);
+    if (binding === undefined) {
+      return undefined;
+    }
+
+    return this.runSessionMutation(binding, async () =>
+      this.rebindAfterControlCommand(binding, {
+        type: "new_session",
+        parentSession
+      })
+    );
+  }
+
+  async switchAndBindSession(sessionKey: string, targetSessionId: string): Promise<SessionRebindResult | undefined> {
+    const binding = this.getBindingBySessionKey(sessionKey);
+    if (binding === undefined) {
+      return undefined;
+    }
+
+    const summary = (await listSessionSummaries(binding.sessionDir)).find((item) => item.id === targetSessionId);
+    if (summary === undefined) {
+      throw new Error("Session file not found");
+    }
+
+    return this.runSessionMutation(binding, async () =>
+      this.rebindAfterControlCommand(binding, {
+        type: "switch_session",
+        sessionPath: summary.filePath
+      })
+    );
   }
 
   async terminateAllSessions(): Promise<TerminateSessionResult[]> {
@@ -303,6 +432,74 @@ export class AdminSessionService {
     }
   }
 
+  private async runSessionMutation<T>(binding: StoredChatBinding, task: () => Promise<T>): Promise<T> {
+    return this.queue === undefined ? task() : this.queue.run(binding, task);
+  }
+
+  private async restartBindingRuntime(binding: StoredChatBinding): Promise<SessionRestartResult> {
+    const stopped = await this.runtime?.shutdownBinding(binding, "admin_restart");
+    const latestBinding = this.bindingStore.getByIdentity(binding) ?? binding;
+    const ensured = latestBinding.protectedRuntime
+      ? await this.runtime?.ensureBinding(latestBinding)
+      : undefined;
+
+    return {
+      sessionKey: encodeChatKey(latestBinding),
+      stoppedRuntime: stopped?.stopped ?? false,
+      protectedRuntime: latestBinding.protectedRuntime,
+      startedRuntime: ensured?.startedRuntime ?? false,
+      pid: ensured?.pid
+    };
+  }
+
+  private async rebindAfterControlCommand(
+    binding: StoredChatBinding,
+    command: Extract<PiRpcControlCommand, { readonly type: "new_session" | "switch_session" }>
+  ): Promise<SessionRebindResult> {
+    if (this.runtime === undefined) {
+      throw new Error("Runtime manager is not available");
+    }
+
+    const wasRunning = this.runtime.hasLiveRuntime(binding);
+    let updatedBinding = binding;
+    let startedRuntime = false;
+    let stoppedRuntime = false;
+    let nextState: PiRpcState | undefined;
+
+    try {
+      const control = await this.runtime.runControlCommand(binding, command, {
+        startIfMissing: true,
+        stopIfStarted: false
+      });
+      startedRuntime = control.startedRuntime;
+      const stateControl = await this.runtime.runControlCommand(binding, { type: "get_state" }, {
+        startIfMissing: true,
+        stopIfStarted: false
+      });
+      nextState = asPiRpcState(stateControl.result);
+      updatedBinding = this.bindingStore.setSessionId(binding, nextState.sessionId) ?? binding;
+      this.runtime.updateBinding(updatedBinding);
+    } finally {
+      if (!wasRunning) {
+        const stopped = await this.runtime.shutdownBinding(updatedBinding, "admin_control");
+        stoppedRuntime = stopped.stopped;
+      }
+    }
+
+    if (nextState === undefined) {
+      throw new Error("Pi did not return a valid session state");
+    }
+
+    return {
+      sessionKey: encodeChatKey(updatedBinding),
+      previousSessionId: binding.sessionId,
+      sessionId: updatedBinding.sessionId,
+      sessionFile: nextState.sessionFile ?? null,
+      startedRuntime,
+      stoppedRuntime
+    };
+  }
+
   private async getRuntimeEntriesByKey(): Promise<Map<string, RuntimeEntryView>> {
     if (this.runtime === undefined) {
       return new Map();
@@ -352,4 +549,17 @@ function getRuntimeActivity(state: PiRpcState | undefined): AdminSessionRuntimeV
   }
 
   return "idle";
+}
+
+function asPiRpcState(value: unknown): PiRpcState {
+  if (typeof value !== "object" || value === null) {
+    throw new Error("Pi did not return a valid session state");
+  }
+
+  const state = value as Partial<PiRpcState>;
+  if (typeof state.sessionId !== "string" || state.sessionId.length === 0) {
+    throw new Error("Pi did not return a valid session id");
+  }
+
+  return state as PiRpcState;
 }

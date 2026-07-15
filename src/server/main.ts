@@ -8,6 +8,7 @@ import { ChatMessageQueue } from "./runtime/chat-message-queue.js";
 import { RuntimeManager } from "./runtime/runtime-manager.js";
 import { ScheduledTaskService } from "./scheduler/scheduled-task-service.js";
 import { ScheduledTaskStore } from "./scheduler/scheduled-task-store.js";
+import { ensureBridgeStartupPromptFile } from "./startup/startup-args.js";
 import { ConversationDispatcher } from "./wecom/conversation-dispatcher.js";
 import { WeComBridge } from "./wecom/wecom-bridge.js";
 import {
@@ -20,19 +21,23 @@ loadEnvironmentFile();
 const config = loadConfig();
 validateStartupConfig(config);
 const bindingStore = new BindingStore(path.join(config.dataDir, "app.db"), config.dataDir);
+const bridgeStartupPromptPath = ensureBridgeStartupPromptFile(config.dataDir);
 const runtime = new RuntimeManager({
   maxProcesses: config.maxProcesses,
   idleTimeoutMs: config.idleTimeoutMs,
   idleReapingEnabled: () => bindingStore.getRuntimePolicy().idleReapingEnabled,
   isProtected: (binding) => bindingStore.isRuntimeProtected(binding),
-  clientFactory: async (binding) =>
-    PiRpcClient.spawn({
+  clientFactory: async (binding) => {
+    const startup = bindingStore.getResolvedStartupArgs(binding);
+    return PiRpcClient.spawn({
       command: config.piCommand,
       cwd: binding.workspacePath,
       sessionId: binding.sessionId,
       sessionDir: binding.sessionDir,
-      sessionName: binding.externalChatId
-    })
+      sessionName: binding.externalChatId,
+      startupArgs: [...(startup?.args ?? []), "--append-system-prompt", bridgeStartupPromptPath]
+    });
+  }
 });
 const queue = new ChatMessageQueue();
 const scheduledTaskStore = new ScheduledTaskStore(path.join(config.dataDir, "app.db"));
@@ -53,7 +58,7 @@ const schedulerInterval = setInterval(() => {
 schedulerInterval.unref();
 const weComBot = startWeComBot(config, (client) => {
   const sender = createWeComSender(client);
-  const dispatcher = new ConversationDispatcher(bindingStore, queue, runtime, sender);
+  const dispatcher = new ConversationDispatcher(queue, runtime, sender);
   scheduledTasks.setDispatcher(dispatcher);
   return new WeComBridge({
     bindingStore,

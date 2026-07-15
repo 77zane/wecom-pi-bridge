@@ -76,11 +76,23 @@ const broadcastControlBodySchema = controlBodySchema.extend({
 const terminateBodySchema = z.object({
   scope: z.literal("all")
 });
+const restartBodySchema = z.object({
+  scope: z.union([z.literal("running"), z.literal("all")])
+});
 const runtimePolicyBodySchema = z.object({
   idleReapingEnabled: z.boolean()
 });
 const sessionProtectionBodySchema = z.object({
   protectedRuntime: z.boolean()
+});
+const startupArgsBodySchema = z.object({
+  args: z.array(z.string())
+});
+const newSessionBodySchema = z.object({
+  parentSession: z.string().min(1).optional()
+});
+const switchSessionBodySchema = z.object({
+  sessionId: z.string().min(1)
 });
 const scheduledTaskScheduleSchema: z.ZodType<ScheduledTaskSchedule> = z.discriminatedUnion("type", [
   z.object({ type: z.literal("once"), runAt: z.string().datetime(), timezone: z.string().optional() }),
@@ -147,12 +159,28 @@ export function createApp(config: AppConfig, services: AppServices = {}) {
 
   app.get("/api/admin/sessions", async () => ({
     runtimePolicy: adminSessionService.getRuntimePolicy(),
+    startupArgs: adminSessionService.getGlobalStartupArgs(),
     sessions: await adminSessionService.listSessions()
   }));
 
   app.get("/api/admin/runtime-policy", async () => ({
     runtimePolicy: adminSessionService.getRuntimePolicy()
   }));
+
+  app.get("/api/admin/startup-args", async () => ({
+    startupArgs: adminSessionService.getGlobalStartupArgs()
+  }));
+
+  app.put("/api/admin/startup-args", async (request, reply) => {
+    const body = startupArgsBodySchema.parse(request.body);
+    try {
+      return {
+        startupArgs: adminSessionService.setGlobalStartupArgs(body.args)
+      };
+    } catch (error: unknown) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
 
   app.post("/api/admin/runtime-policy", async (request) => {
     const body = runtimePolicyBodySchema.parse(request.body);
@@ -205,6 +233,14 @@ export function createApp(config: AppConfig, services: AppServices = {}) {
     };
   });
 
+  app.post("/api/admin/sessions/restart", async (request) => {
+    const body = restartBodySchema.parse(request.body);
+    return {
+      scope: body.scope,
+      results: await adminSessionService.restartRuntimes(body.scope)
+    };
+  });
+
   app.post("/api/admin/sessions/:sessionKey/stop", async (request, reply) => {
     const params = z
       .object({
@@ -217,6 +253,54 @@ export function createApp(config: AppConfig, services: AppServices = {}) {
     }
 
     return { stop };
+  });
+
+  app.post("/api/admin/sessions/:sessionKey/restart", async (request, reply) => {
+    const params = z
+      .object({
+        sessionKey: z.string().min(1)
+      })
+      .parse(request.params);
+    const restart = await adminSessionService.restartSessionRuntime(params.sessionKey);
+    if (restart === undefined) {
+      return reply.code(404).send({ error: "session not found" });
+    }
+
+    return { restart };
+  });
+
+  app.put("/api/admin/sessions/:sessionKey/startup-args", async (request, reply) => {
+    const params = z
+      .object({
+        sessionKey: z.string().min(1)
+      })
+      .parse(request.params);
+    const body = startupArgsBodySchema.parse(request.body);
+
+    try {
+      const binding = adminSessionService.setWorkspaceStartupArgs(params.sessionKey, body.args);
+      if (binding === undefined) {
+        return reply.code(404).send({ error: "session not found" });
+      }
+
+      return { binding };
+    } catch (error: unknown) {
+      return reply.code(400).send({ error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+
+  app.delete("/api/admin/sessions/:sessionKey/startup-args", async (request, reply) => {
+    const params = z
+      .object({
+        sessionKey: z.string().min(1)
+      })
+      .parse(request.params);
+    const binding = adminSessionService.clearWorkspaceStartupArgs(params.sessionKey);
+    if (binding === undefined) {
+      return reply.code(404).send({ error: "session not found" });
+    }
+
+    return { binding };
   });
 
   app.post("/api/admin/sessions/:sessionKey/protection", async (request, reply) => {
@@ -236,6 +320,59 @@ export function createApp(config: AppConfig, services: AppServices = {}) {
       return { protection };
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
+      if (message.startsWith("Pi process limit reached")) {
+        return reply.code(409).send({ error: message });
+      }
+
+      throw error;
+    }
+  });
+
+  app.post("/api/admin/sessions/:sessionKey/new-session", async (request, reply) => {
+    const params = z
+      .object({
+        sessionKey: z.string().min(1)
+      })
+      .parse(request.params);
+    const body = newSessionBodySchema.parse(request.body ?? {});
+
+    try {
+      const session = await adminSessionService.createAndBindNewSession(params.sessionKey, body.parentSession);
+      if (session === undefined) {
+        return reply.code(404).send({ error: "session not found" });
+      }
+
+      return { session };
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.startsWith("Pi process limit reached")) {
+        return reply.code(409).send({ error: message });
+      }
+
+      throw error;
+    }
+  });
+
+  app.post("/api/admin/sessions/:sessionKey/switch-session", async (request, reply) => {
+    const params = z
+      .object({
+        sessionKey: z.string().min(1)
+      })
+      .parse(request.params);
+    const body = switchSessionBodySchema.parse(request.body);
+
+    try {
+      const session = await adminSessionService.switchAndBindSession(params.sessionKey, body.sessionId);
+      if (session === undefined) {
+        return reply.code(404).send({ error: "session not found" });
+      }
+
+      return { session };
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message === "Session file not found") {
+        return reply.code(404).send({ error: message });
+      }
       if (message.startsWith("Pi process limit reached")) {
         return reply.code(409).send({ error: message });
       }

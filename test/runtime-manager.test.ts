@@ -114,7 +114,8 @@ function createBinding(id: string): StoredChatBinding {
     sessionId: `s-${id}`,
     sessionDir: `C:\\data\\${id}\\.pi-sessions`,
     inboxDir: `C:\\data\\${id}\\inbox`,
-    protectedRuntime: false
+    protectedRuntime: false,
+    startupArgs: null
   };
 }
 

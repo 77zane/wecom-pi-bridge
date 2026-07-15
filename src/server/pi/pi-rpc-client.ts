@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import type { Readable, Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { z } from "zod";
+import { normalizeStartupArgs } from "../startup/startup-args.js";
 
 export type PiRpcDelivery = "prompt" | "follow_up";
 export type PiRpcShutdownResult = "already-exited" | "exited" | "killed" | "force-killed" | "kill-timeout";
@@ -60,6 +61,7 @@ export interface PiRpcSpawnOptions {
   readonly sessionId: string;
   readonly sessionDir: string;
   readonly sessionName?: string;
+  readonly startupArgs?: readonly string[] | undefined;
   readonly env?: NodeJS.ProcessEnv;
 }
 
@@ -501,11 +503,17 @@ async function waitForExitOrTimeout(exitPromise: Promise<void>, timeoutMs: numbe
   });
 }
 
-export function buildPiRpcArgs(options: Pick<PiRpcSpawnOptions, "sessionId" | "sessionDir" | "sessionName">): string[] {
+export function buildPiRpcArgs(
+  options: Pick<PiRpcSpawnOptions, "sessionId" | "sessionDir" | "sessionName" | "startupArgs">
+): string[] {
   const args = ["--mode", "rpc", "--session-id", options.sessionId, "--session-dir", options.sessionDir];
 
   if (options.sessionName !== undefined && options.sessionName.trim().length > 0) {
     args.push("--name", options.sessionName);
+  }
+
+  if (options.startupArgs !== undefined) {
+    args.push(...normalizeStartupArgs(options.startupArgs));
   }
 
   return args;

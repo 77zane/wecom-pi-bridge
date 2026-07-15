@@ -2,7 +2,6 @@ import path from "node:path";
 import { z } from "zod";
 import type { WeComMediaType } from "@wecom/aibot-node-sdk";
 
-export const WECOM_FILE_PROTOCOL_VERSION = 2;
 export const WECOM_FILE_PROTOCOL_INSTRUCTION = [
   "平台能力说明：如果你需要让企业微信发送你生成的文件，请把文件写入当前 workspace 的 outbox/ 目录，并在回复中单独输出这个 JSON 指令：",
   '{"wecom_files":[{"path":"outbox/文件名","type":"file"}]}',
@@ -36,10 +35,6 @@ const directiveSchema = z.object({
     })
   )
 });
-
-export function addWeComFileProtocolInstruction(message: string): string {
-  return `${WECOM_FILE_PROTOCOL_INSTRUCTION}\n\n用户原始消息：\n${message}`;
-}
 
 export function extractWeComFileDirectives(text: string): ExtractedWeComFileDirectives {
   const files: WeComFileDirective[] = [];

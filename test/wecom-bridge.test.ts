@@ -197,8 +197,7 @@ describe("WeComBridge", () => {
 
     await bridge.handleTextMessage(createTextMessage());
 
-    expect(runtime.messages[0]?.message).toContain("平台能力说明");
-    expect(runtime.messages[0]?.message.endsWith("hello")).toBe(true);
+    expect(runtime.messages[0]?.message).toBe("hello");
     expect(runtime.messages[0]?.binding.workspacePath).toContain(path.join("single", "user-a"));
     expect(sender.sent).toEqual([
       {
@@ -213,7 +212,7 @@ describe("WeComBridge", () => {
     ]);
   });
 
-  it("injects the file protocol only once for a binding", async () => {
+  it("forwards text prompts without injecting the file protocol", async () => {
     const dataDir = await createTempDir();
     const store = new BindingStore(path.join(dataDir, "app.db"), dataDir);
     stores.push(store);
@@ -224,8 +223,7 @@ describe("WeComBridge", () => {
     await bridge.handleTextMessage(createTextMessage({ text: { content: "first" } }));
     await bridge.handleTextMessage(createTextMessage({ text: { content: "second" } }));
 
-    expect(runtime.messages[0]?.message).toContain("平台能力说明");
-    expect(runtime.messages[0]?.message.endsWith("first")).toBe(true);
+    expect(runtime.messages[0]?.message).toBe("first");
     expect(runtime.messages[1]?.message).toBe("second");
   });
 

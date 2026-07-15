@@ -64,6 +64,7 @@ type ShutdownReason =
   | "admin_stop"
   | "admin_reset"
   | "admin_control"
+  | "admin_restart"
   | "scheduled_task";
 
 export class RuntimeManager {
@@ -171,6 +172,20 @@ export class RuntimeManager {
     };
   }
 
+  updateBinding(binding: StoredChatBinding): boolean {
+    const key = getBindingKey(binding);
+    const entry = this.entries.get(key);
+    if (entry === undefined) {
+      return false;
+    }
+
+    this.entries.set(key, {
+      ...entry,
+      binding
+    });
+    return true;
+  }
+
   async runControlCommand(
     binding: StoredChatBinding,
     command: PiRpcControlCommand,
@@ -209,7 +224,7 @@ export class RuntimeManager {
 
   async shutdownBinding(
     binding: StoredChatBinding,
-    reason: Extract<ShutdownReason, "admin_stop" | "admin_reset" | "scheduled_task"> = "admin_stop"
+    reason: Extract<ShutdownReason, "admin_stop" | "admin_reset" | "admin_control" | "admin_restart" | "scheduled_task"> = "admin_stop"
   ): Promise<{ readonly stopped: boolean; readonly result?: PiRpcShutdownResult | undefined }> {
     const key = getBindingKey(binding);
     const entry = this.entries.get(key);
