@@ -4,6 +4,8 @@
 
 `wecom-pi-bridge` connects a WeCom intelligent bot to local Pi RPC sessions. It receives WeCom messages, maps each chat to a stable workspace/session, forwards prompts to Pi, and sends Pi's text/file replies back to WeCom.
 
+![Operations console overview](./docs/screenshots/console-overview.png)
+
 ## Features
 
 - WeCom intelligent bot WebSocket integration.

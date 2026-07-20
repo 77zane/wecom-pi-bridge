@@ -4,6 +4,8 @@
 
 `wecom-pi-bridge` 是企业微信智能机器人和本地 Pi RPC 会话之间的桥接服务。它接收企业微信消息，按会话绑定稳定 workspace/session，把 prompt 投递给 Pi，并把 Pi 的文本和文件回复回传到企业微信。
 
+![运维控制台概览](./docs/screenshots/console-overview.png)
+
 ## 功能
 
 - 企业微信智能机器人 WebSocket 接入。
